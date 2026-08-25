@@ -1,5 +1,5 @@
-# trader.py — Mike Trader Pro Cloud (FINAL FIX — Guaranteed Trades)
-# =================================================================
+# trader.py — Mike Trader Pro Cloud (FINAL FIX)
+# =============================================
 
 import requests
 import time
@@ -103,13 +103,12 @@ def compute_agent_scores(prices):
     for coin, data in prices.items():
         price = data["price"]
         change_24h = data.get("change_24h", 0)
-
+        
         if coin not in state.price_history:
             state.price_history[coin] = deque(maxlen=100)
         state.price_history[coin].append(price)
         hist = list(state.price_history[coin])
-
-        # Trend: 24h momentum
+        
         trend_score = 50
         trend_dir = "NEUTRAL"
         if abs(change_24h) > 1:
@@ -118,8 +117,7 @@ def compute_agent_scores(prices):
         elif abs(change_24h) > 0.3:
             trend_score = 52 + min(abs(change_24h) * 3, 8)
             trend_dir = "UP" if change_24h > 0 else "DOWN"
-
-        # Momentum
+        
         mom_score = 50
         mom_dir = "NEUTRAL"
         if len(hist) >= 3:
@@ -130,8 +128,7 @@ def compute_agent_scores(prices):
         elif abs(change_24h) > 0.5:
             mom_score = 52 + min(abs(change_24h), 15)
             mom_dir = "UP" if change_24h > 0 else "DOWN"
-
-        # Volatility
+        
         vol_score = 50
         vol_dir = "NEUTRAL"
         if abs(change_24h) > 2:
@@ -140,8 +137,7 @@ def compute_agent_scores(prices):
         elif abs(change_24h) > 0.5:
             vol_score = 52 + min(abs(change_24h) * 2, 10)
             vol_dir = "UP" if change_24h > 0 else "DOWN"
-
-        # Support/Resistance
+        
         sr_score = 50
         sr_dir = "NEUTRAL"
         if len(hist) >= 5:
@@ -153,8 +149,7 @@ def compute_agent_scores(prices):
                     sr_score = 58; sr_dir = "DOWN"
                 elif pos < 0.2 and change_24h > 0:
                     sr_score = 58; sr_dir = "UP"
-
-        # Mean Reversion
+        
         mr_score = 50
         mr_dir = "NEUTRAL"
         if len(hist) >= 5:
@@ -164,7 +159,7 @@ def compute_agent_scores(prices):
                 if abs(dev) > 0.3:
                     mr_score = 55 + min(abs(dev) * 5, 25)
                     mr_dir = "DOWN" if dev > 0 else "UP"
-
+        
         signals[coin] = {
             "price": price,
             "change_24h": change_24h,
@@ -178,20 +173,15 @@ def compute_agent_scores(prices):
         }
     return signals
 
-# ─── FIXED CONSENSUS — Simpler, Guaranteed to Trade ───
 def get_consensus(signals):
-    """Simplified consensus: if avg score >= threshold and majority direction, trade."""
     trades = []
-
     for coin, data in signals.items():
         agents = data["agents"]
-
-        # Calculate average score across all agents
         total_score = 0
         total_weight = 0
         up_votes = 0
         down_votes = 0
-
+        
         for name, info in agents.items():
             w = state.agent_weights.get(name, 1.0)
             total_score += info["score"] * w
@@ -200,26 +190,23 @@ def get_consensus(signals):
                 up_votes += w
             elif info["dir"] == "DOWN":
                 down_votes += w
-
+        
         avg_score = total_score / total_weight if total_weight > 0 else 50
-
-        # Direction: simple majority (no 1.05x multiplier)
+        
         if up_votes > down_votes:
             direction = "UP"
-            # Edge = avg score of agents voting UP
             up_scores = [agents[n]["score"] * state.agent_weights.get(n, 1.0) 
                         for n in agents if agents[n]["dir"] == "UP"]
-            edge = sum(up_scores) / sum(state.agent_weights.get(n, 1.0) for n in agents if agents[n]["dir"] == "UP") if up_scores else 0
+            edge = sum(up_scores) / len(up_scores) if up_scores else 0
         elif down_votes > up_votes:
             direction = "DOWN"
             down_scores = [agents[n]["score"] * state.agent_weights.get(n, 1.0) 
                           for n in agents if agents[n]["dir"] == "DOWN"]
-            edge = sum(down_scores) / sum(state.agent_weights.get(n, 1.0) for n in agents if agents[n]["dir"] == "DOWN") if down_scores else 0
+            edge = sum(down_scores) / len(down_scores) if down_scores else 0
         else:
             direction = "NEUTRAL"
             edge = 0
-
-        # TRADE IF: avg score >= threshold AND we have a direction
+        
         if avg_score >= MIN_CONFIDENCE and edge >= MIN_EDGE and direction != "NEUTRAL":
             trades.append({
                 "coin": coin,
@@ -231,7 +218,7 @@ def get_consensus(signals):
                 "change_24h": data["change_24h"],
                 "agents": agents
             })
-
+    
     trades.sort(key=lambda x: x["edge"], reverse=True)
     return trades
 
@@ -240,16 +227,16 @@ def execute_paper_trade(trade):
     direction = trade["direction"]
     price = trade["price"]
     position_size = (state.capital * POSITION_SIZE_PCT) / 100
-
+    
     if len(state.positions) >= MAX_POSITIONS:
         return False
     if state.daily_loss >= DAILY_LOSS_LIMIT:
         return False
     if state.total_pl <= -TOTAL_LOSS_LIMIT:
         return False
-
+    
     leading = max(trade["agents"], key=lambda k: trade["agents"][k]["score"])
-
+    
     position = {
         "id": len(state.trade_history) + len(state.positions) + 1,
         "symbol": symbol,
@@ -264,10 +251,10 @@ def execute_paper_trade(trade):
         "leading_agent": leading,
         "change_24h_at_entry": trade["change_24h"]
     }
-
+    
     state.positions.append(position)
     state.last_trade_time = datetime.now().strftime("%H:%M:%S")
-
+    
     emoji = "📈" if direction == "UP" else "📉"
     state.log(f"{emoji} TRADE #{position['id']}: {symbol} {direction} @ ${price:.4f} | Size: ${position_size:.2f} | Edge: {trade['edge']:.1f} | 24h: {trade['change_24h']:+.2f}%")
     return True
@@ -280,23 +267,23 @@ def check_positions(prices):
         for c, s in COIN_SYMBOLS.items():
             if s == symbol:
                 coin = c; break
-
+        
         if coin not in prices:
             continue
-
+        
         current_price = prices[coin]["price"]
         pos["current_price"] = current_price
         direction = pos["direction"]
         entry = pos["entry_price"]
         size = pos["size"]
-
+        
         if direction == "UP":
             pnl_pct = ((current_price - entry) / entry) * 100
         else:
             pnl_pct = ((entry - current_price) / entry) * 100
-
+        
         pnl_dollar = size * (pnl_pct / 100)
-
+        
         if pnl_pct <= -STOP_LOSS_PCT:
             state.log(f"🛑 STOP LOSS: {symbol} @ ${current_price:.4f} | Loss: ${abs(pnl_dollar):.2f}")
             close_position(pos, pnl_dollar, "STOP_LOSS")
@@ -305,7 +292,7 @@ def check_positions(prices):
             state.log(f"🎯 TAKE PROFIT: {symbol} @ ${current_price:.4f} | Profit: ${pnl_dollar:.2f}")
             close_position(pos, pnl_dollar, "TAKE_PROFIT")
             closed.append(pos)
-
+    
     return closed
 
 def close_position(pos, pnl_dollar, reason):
@@ -313,23 +300,23 @@ def close_position(pos, pnl_dollar, reason):
     state.capital += pnl_dollar
     state.daily_pl += pnl_dollar
     state.total_pl += pnl_dollar
-
+    
     if pnl_dollar < 0:
         state.daily_loss += abs(pnl_dollar)
-
+    
     agent = pos.get("leading_agent", "Trend")
     if agent not in state.agent_scores:
         state.agent_scores[agent] = {"wins": 0, "losses": 0, "pl": 0.0, "streak": 0}
-
+    
     if pnl_dollar > 0:
         state.agent_scores[agent]["wins"] += 1
         state.agent_scores[agent]["streak"] = max(state.agent_scores[agent].get("streak", 0) + 1, 1)
     else:
         state.agent_scores[agent]["losses"] += 1
         state.agent_scores[agent]["streak"] = min(state.agent_scores[agent].get("streak", 0) - 1, -1)
-
+    
     state.agent_scores[agent]["pl"] += pnl_dollar
-
+    
     state.trade_history.append({
         "symbol": pos["symbol"],
         "direction": pos["direction"],
@@ -345,27 +332,27 @@ def run_scan():
     with state.lock:
         state.scan_count += 1
         state.log(f"🔍 Scan #{state.scan_count} started...")
-
+        
         prices = fetch_prices()
         if not prices:
             state.log("❌ No price data")
             return
-
+        
         state.log(f"✅ Fetched {len(prices)} prices")
-
+        
         movers = sorted(prices.items(), key=lambda x: abs(x[1].get("change_24h", 0)), reverse=True)[:3]
         for coin, data in movers:
             sym = COIN_SYMBOLS.get(coin, coin.upper())
             chg = data.get("change_24h", 0)
             state.log(f"   📊 {sym}: ${data['price']:.4f} ({chg:+.2f}%)")
-
+        
         closed = check_positions(prices)
         if closed:
             state.log(f"📊 Closed {len(closed)} position(s)")
-
+        
         signals = compute_agent_scores(prices)
         trades = get_consensus(signals)
-
+        
         if trades:
             state.log(f"🎯 Found {len(trades)} trade setup(s)")
             for t in trades[:MAX_POSITIONS - len(state.positions)]:
@@ -379,20 +366,20 @@ def run_scan():
             up_count = dirs.count("UP")
             down_count = dirs.count("DOWN")
             state.log(f"😴 No trades — best avg: {avg_score:.0f} | UP:{up_count} DOWN:{down_count} (need clear majority)")
-
+        
         state.log(f"💰 Capital: ${state.capital:.2f} | Daily: ${state.daily_pl:+.2f} | Total: ${state.total_pl:+.2f} | Pos: {len(state.positions)}/{MAX_POSITIONS}")
 
 def trading_loop():
     state.log("🚀 Mike Trader Pro Cloud — Starting...")
     state.log(f"   Mode: {state.mode} | Capital: ${state.capital:.2f} | Thresholds: {MIN_CONFIDENCE}+ / {MIN_EDGE}+")
-
+    
     while state.running:
         if state.status == "RUNNING":
             try:
                 run_scan()
             except Exception as e:
                 state.log(f"💥 Error: {e}")
-
+        
         for _ in range(SCAN_INTERVAL_SECONDS):
             if not state.running:
                 break
