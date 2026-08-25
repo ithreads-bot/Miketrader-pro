@@ -1,5 +1,5 @@
-# trader.py — Mike Trader Pro Cloud (GUARANTEED TRADE VERSION)
-# ==============================================================
+# trader.py — Mike Trader Pro Cloud (FIXED NoneType ERROR)
+# =========================================================
 
 import requests
 import time
@@ -10,7 +10,6 @@ from collections import deque
 
 from mike_config import *
 
-# ─── Global State ───
 class BotState:
     def __init__(self):
         self.status = "STOPPED"
@@ -74,7 +73,6 @@ class BotState:
 
 state = BotState()
 
-# ─── Price Fetching ───
 def fetch_prices():
     try:
         ids = ",".join(COINS)
@@ -87,7 +85,7 @@ def fetch_prices():
                 if coin in data and "usd" in data[coin]:
                     prices[coin] = {
                         "price": data[coin]["usd"],
-                        "change_24h": data[coin].get("usd_24h_change", 0)
+                        "change_24h": data[coin].get("usd_24h_change", 0) or 0
                     }
             return prices
         elif resp.status_code == 429:
@@ -100,26 +98,23 @@ def fetch_prices():
         state.log(f"⚠️ Error: {e}")
         return {}
 
-# ─── Agent Scoring ───
 def compute_agent_scores(prices):
     signals = {}
     for coin, data in prices.items():
         price = data["price"]
-        change_24h = data.get("change_24h", 0)
+        change_24h = data.get("change_24h", 0) or 0
         
         if coin not in state.price_history:
             state.price_history[coin] = deque(maxlen=100)
         state.price_history[coin].append(price)
         hist = list(state.price_history[coin])
         
-        # Trend: 24h momentum
         trend_score = 50
         trend_dir = "NEUTRAL"
         if abs(change_24h) > 1:
             trend_score = 55 + min(abs(change_24h) * 2, 30)
             trend_dir = "UP" if change_24h > 0 else "DOWN"
         
-        # Momentum: recent change
         mom_score = 50
         mom_dir = "NEUTRAL"
         if len(hist) >= 3:
@@ -131,7 +126,6 @@ def compute_agent_scores(prices):
             mom_score = 52 + min(abs(change_24h), 15)
             mom_dir = "UP" if change_24h > 0 else "DOWN"
         
-        # Volatility
         vol_score = 50
         vol_dir = "NEUTRAL"
         if abs(change_24h) > 2:
@@ -141,7 +135,6 @@ def compute_agent_scores(prices):
             vol_score = 52 + min(abs(change_24h) * 2, 10)
             vol_dir = "UP" if change_24h > 0 else "DOWN"
         
-        # Support/Resistance
         sr_score = 50
         sr_dir = "NEUTRAL"
         if len(hist) >= 5:
@@ -154,7 +147,6 @@ def compute_agent_scores(prices):
                 elif pos < 0.2 and change_24h > 0:
                     sr_score = 58; sr_dir = "UP"
         
-        # Mean Reversion
         mr_score = 50
         mr_dir = "NEUTRAL"
         if len(hist) >= 5:
@@ -178,7 +170,6 @@ def compute_agent_scores(prices):
         }
     return signals
 
-# ─── Consensus ───
 def get_consensus(signals):
     trades = []
     for coin, data in signals.items():
@@ -223,7 +214,6 @@ def get_consensus(signals):
     trades.sort(key=lambda x: x["edge"], reverse=True)
     return trades
 
-# ─── Trade Execution ───
 def execute_paper_trade(trade):
     symbol = trade["symbol"]
     direction = trade["direction"]
@@ -261,7 +251,6 @@ def execute_paper_trade(trade):
     state.log(f"{emoji} TRADE #{position['id']}: {symbol} {direction} @ ${price:.4f} | Size: ${position_size:.2f} | Edge: {trade['edge']:.1f} | 24h: {trade['change_24h']:+.2f}%")
     return True
 
-# ─── Check Positions ───
 def check_positions(prices):
     closed = []
     for pos in state.positions[:]:
@@ -331,7 +320,6 @@ def close_position(pos, pnl_dollar, reason):
         "agent": agent
     })
 
-# ─── Main Loop ───
 def run_scan():
     with state.lock:
         state.scan_count += 1
@@ -344,19 +332,16 @@ def run_scan():
         
         state.log(f"✅ Fetched {len(prices)} prices")
         
-        # Show top movers
-        movers = sorted(prices.items(), key=lambda x: abs(x[1].get("change_24h", 0)), reverse=True)[:3]
+        movers = sorted(prices.items(), key=lambda x: abs(x[1].get("change_24h", 0) or 0), reverse=True)[:3]
         for coin, data in movers:
             sym = COIN_SYMBOLS.get(coin, coin.upper())
-            chg = data.get("change_24h", 0)
+            chg = data.get("change_24h", 0) or 0
             state.log(f"   📊 {sym}: ${data['price']:.4f} ({chg:+.2f}%)")
         
-        # Check positions
         closed = check_positions(prices)
         if closed:
             state.log(f"📊 Closed {len(closed)} position(s)")
         
-        # Run agents
         signals = compute_agent_scores(prices)
         trades = get_consensus(signals)
         
@@ -388,7 +373,6 @@ def trading_loop():
                 break
             time.sleep(1)
 
-# ─── Controls ───
 def start():
     if state.status == "RUNNING":
         return {"message": "Already running"}
@@ -423,7 +407,6 @@ def set_mode(mode):
         return {"message": f"Mode: {mode}", "mode": mode}
     return {"error": "Invalid mode"}
 
-# Auto-start
 if __name__ == "__main__":
     start()
     while True:
