@@ -1,485 +1,2312 @@
-# trader.py — Mike Trader Pro Cloud (REAL LEARNING VERSION)
+# trader.py — Mike Trader Pro Cloud
 # =========================================================
-# Each trade is assigned to the agent that triggered it.
-# Auto-optimizer adjusts weights based on REAL performance.
+# LEARNING ENGINE v2 — MERGED + DEADLOCK FIX
+#
+# Merge of:
+#   - Learning Engine v2 (best learning system)
+#   - Deadlock fixes from Mike Trader Pro sessions:
+#       1. 4-HOUR POSITION TIMEOUT (no more stuck trades)
+#       2. SL 2% / TP 3% (faster trades, set in mike_config.py)
+#       3. MAX_POSITIONS 5 (more action, set in mike_config.py)
+#
+#       v2.1 UPGRADES:
+#       4. 💾 PERSISTENCE — learning auto-saved to
+#          bot_state.json, survives restarts
+#       5. 💸 FEES — 0.5% round-trip per trade
+#          (paper results now match reality)
+#       6. 🛡️ CRASH GUARD — no new trades while
+#          BTC is dumping (-5% in 24h)
+#
+# PAPER-FIRST VERSION
+#
+# Improvements:
+# - Correct agent attribution
+# - Performance-based learning
+# - Recent + lifetime performance
+# - Daily reset
+# - Better short-term momentum
+# - Trade journal
+# - Cooldowns
+# - Safer optimizer
+# - Better logging
+#
+# IMPORTANT:
+# This file does NOT execute real-money trades.
+# "AUTO" remains paper execution until a separate broker
+# execution layer is intentionally added.
 
 import requests
 import time
-import random
 import threading
-from datetime import datetime
+import json
+import os
+from datetime import datetime, date
 from collections import deque
 
 from mike_config import *
 
-# ─── Global State ───
+
+# =========================================================
+# CONSTANTS
+# =========================================================
+
+AGENTS = [
+    "Trend",
+    "Momentum",
+    "Volatility",
+    "SupportResist",
+    "MeanReversion"
+]
+
+DEFAULT_AGENT_STATS = {
+    "wins": 0,
+    "losses": 0,
+    "pl": 0.0,
+    "streak": 0,
+    "trades": 0,
+    "recent_results": [],
+    "recent_pl": []
+}
+
+MIN_LEARNING_TRADES = 5
+WEIGHT_MIN = 0.50
+WEIGHT_MAX = 2.50
+
+WEIGHT_UP_FACTOR = 1.08
+WEIGHT_DOWN_FACTOR = 0.92
+
+TRADE_COOLDOWN_SECONDS = 300
+
+
+# =========================================================
+# GLOBAL STATE
+# =========================================================
+
 class BotState:
+
     def __init__(self):
+
         self.status = "STOPPED"
+
         self.mode = TRADING_MODE
-        self.capital = PAPER_CAPITAL if TRADING_MODE == "PAPER" else REAL_CAPITAL
+
+        self.capital = (
+            PAPER_CAPITAL
+            if TRADING_MODE == "PAPER"
+            else REAL_CAPITAL
+        )
+
+        self.starting_capital = self.capital
+
         self.daily_pl = 0.0
         self.total_pl = 0.0
+
         self.positions = []
+
         self.trade_history = []
+
         self.agent_scores = {}
+
         self.agent_weights = AGENT_WEIGHTS.copy()
+
         self.price_history = {}
+
         self.scan_count = 0
+
         self.last_trade_time = None
+
         self.daily_loss = 0.0
-        self.logs = deque(maxlen=300)
+
+        self.current_day = date.today()
+
+        self.btc_change_24h = 0.0
+
+        self.last_trade_by_coin = {}
+
+        self.logs = deque(maxlen=500)
+
         self.running = False
+
         self.thread = None
-        self.lock = threading.Lock()
+
+        self.lock = threading.RLock()
+
+        # Initialize every agent
+        for agent in AGENTS:
+            self.agent_scores[agent] = self._new_agent_stats()
+
+    def _new_agent_stats(self):
+        return {
+            "wins": 0,
+            "losses": 0,
+            "pl": 0.0,
+            "streak": 0,
+            "trades": 0,
+            "recent_results": deque(maxlen=20),
+            "recent_pl": deque(maxlen=20)
+        }
 
     def log(self, msg):
+
         timestamp = datetime.now().strftime("%H:%M:%S")
+
         entry = f"[{timestamp}] {msg}"
+
         self.logs.append(entry)
+
         if VERBOSE:
             print(entry)
 
+    def reset_daily_if_needed(self):
+
+        today = date.today()
+
+        if today != self.current_day:
+
+            self.log(
+                f"📅 New trading day — "
+                f"resetting daily P/L and daily loss."
+            )
+
+            self.current_day = today
+
+            self.daily_pl = 0.0
+
+            self.daily_loss = 0.0
+
     def get_status_dict(self):
+
         with self.lock:
+
+            self.reset_daily_if_needed()
+
             return {
                 "status": self.status,
                 "mode": self.mode,
                 "capital": round(self.capital, 2),
+                "starting_capital": round(
+                    self.starting_capital, 2
+                ),
                 "daily_pl": round(self.daily_pl, 2),
                 "total_pl": round(self.total_pl, 2),
                 "positions": len(self.positions),
                 "max_positions": MAX_POSITIONS,
                 "scan_count": self.scan_count,
-                "daily_loss": round(self.daily_loss, 2),
+                "daily_loss": round(
+                    self.daily_loss, 2
+                ),
                 "logs": list(self.logs)[-25:],
                 "agents": self.get_agent_summary(),
-                "last_trade": self.last_trade_time or "Never"
+                "last_trade": (
+                    self.last_trade_time
+                    or "Never"
+                )
             }
 
     def get_agent_summary(self):
+
         summary = {}
-        for name in ["Trend", "Momentum", "Volatility", "SupportResist", "MeanReversion"]:
-            scores = self.agent_scores.get(name, {"wins": 0, "losses": 0, "pl": 0.0, "streak": 0, "trades": 0})
-            total = scores.get("wins", 0) + scores.get("losses", 0)
-            win_rate = (scores["wins"] / total * 100) if total > 0 else 0
-            weight = self.agent_weights.get(name, 1.0)
+
+        for name in AGENTS:
+
+            scores = self.agent_scores.get(
+                name,
+                self._new_agent_stats()
+            )
+
+            total = (
+                scores.get("wins", 0)
+                + scores.get("losses", 0)
+            )
+
+            if total > 0:
+
+                win_rate = (
+                    scores["wins"]
+                    / total
+                    * 100
+                )
+
+            else:
+
+                win_rate = 0
+
+            recent = list(
+                scores.get(
+                    "recent_results",
+                    []
+                )
+            )
+
+            recent_wr = (
+                sum(recent)
+                / len(recent)
+                * 100
+                if recent
+                else 0
+            )
+
             summary[name] = {
-                "wins": scores.get("wins", 0),
-                "losses": scores.get("losses", 0),
-                "win_rate": round(win_rate, 1),
-                "pl": round(scores.get("pl", 0.0), 2),
-                "streak": scores.get("streak", 0),
-                "weight": round(weight, 2),
-                "trades": scores.get("trades", 0)
+
+                "wins": scores.get(
+                    "wins", 0
+                ),
+
+                "losses": scores.get(
+                    "losses", 0
+                ),
+
+                "trades": scores.get(
+                    "trades", 0
+                ),
+
+                "win_rate": round(
+                    win_rate, 1
+                ),
+
+                "recent_win_rate": round(
+                    recent_wr, 1
+                ),
+
+                "pl": round(
+                    scores.get(
+                        "pl", 0.0
+                    ),
+                    2
+                ),
+
+                "streak": scores.get(
+                    "streak", 0
+                ),
+
+                "weight": round(
+                    self.agent_weights.get(
+                        name,
+                        1.0
+                    ),
+                    2
+                )
             }
+
         return summary
+
+
+# =========================================================
+# STATE PERSISTENCE 💾
+# Saves all learning to disk (bot_state.json) so the bot
+# NEVER loses its memory when the server restarts.
+# Delete bot_state.json to factory-reset the bot.
+# =========================================================
+
+def save_state():
+
+    try:
+
+        data = {
+
+            "version": 1,
+
+            "saved_at":
+                datetime.now().isoformat(),
+
+            "current_day":
+                str(date.today()),
+
+            "capital":
+                state.capital,
+
+            "starting_capital":
+                state.starting_capital,
+
+            "daily_pl":
+                state.daily_pl,
+
+            "total_pl":
+                state.total_pl,
+
+            "daily_loss":
+                state.daily_loss,
+
+            "scan_count":
+                state.scan_count,
+
+            "agent_weights":
+                dict(state.agent_weights),
+
+            "agent_scores": {
+
+                name: {
+
+                    "wins":
+                        s.get("wins", 0),
+
+                    "losses":
+                        s.get("losses", 0),
+
+                    "pl":
+                        s.get("pl", 0.0),
+
+                    "streak":
+                        s.get("streak", 0),
+
+                    "trades":
+                        s.get("trades", 0),
+
+                    "recent_results":
+                        list(
+                            s.get(
+                                "recent_results",
+                                []
+                            )
+                        ),
+
+                    "recent_pl":
+                        list(
+                            s.get(
+                                "recent_pl",
+                                []
+                            )
+                        )
+
+                }
+
+                for name, s in state.agent_scores.items()
+            },
+
+            "price_history": {
+
+                coin: list(hist)[-200:]
+
+                for coin, hist
+                in state.price_history.items()
+            },
+
+            "trade_history":
+                list(state.trade_history)[-300:]
+        }
+
+        with open(STATE_FILE, "w") as f:
+
+            json.dump(data, f, indent=1)
+
+    except Exception as e:
+
+        state.log(
+            f"⚠️ Could not save state: {e}"
+        )
+
+
+def load_state():
+
+    if not os.path.exists(STATE_FILE):
+
+        state.log(
+            "🆕 No saved state found — "
+            "starting fresh."
+        )
+
+        return
+
+    try:
+
+        with open(STATE_FILE) as f:
+
+            data = json.load(f)
+
+        state.capital = data.get(
+            "capital",
+            state.capital
+        )
+
+        state.starting_capital = data.get(
+            "starting_capital",
+            state.starting_capital
+        )
+
+        state.total_pl = data.get(
+            "total_pl",
+            0.0
+        )
+
+        state.scan_count = data.get(
+            "scan_count",
+            0
+        )
+
+        # Only restore DAILY counters if the saved
+        # state is from today — otherwise daily
+        # limits would carry over incorrectly.
+        saved_day = data.get(
+            "current_day",
+            ""
+        )
+
+        if saved_day == str(date.today()):
+
+            state.daily_pl = data.get(
+                "daily_pl",
+                0.0
+            )
+
+            state.daily_loss = data.get(
+                "daily_loss",
+                0.0
+            )
+
+        else:
+
+            state.log(
+                "📅 Saved state is from a previous "
+                "day — daily counters reset."
+            )
+
+        saved_weights = data.get(
+            "agent_weights",
+            {}
+        )
+
+        for name, w in saved_weights.items():
+
+            if name in state.agent_weights:
+
+                state.agent_weights[name] = w
+
+        saved_scores = data.get(
+            "agent_scores",
+            {}
+        )
+
+        for name, s in saved_scores.items():
+
+            stats = state._new_agent_stats()
+
+            stats["wins"] = s.get("wins", 0)
+
+            stats["losses"] = s.get("losses", 0)
+
+            stats["pl"] = s.get("pl", 0.0)
+
+            stats["streak"] = s.get("streak", 0)
+
+            stats["trades"] = s.get("trades", 0)
+
+            for r in s.get(
+                "recent_results",
+                []
+            ):
+
+                stats["recent_results"].append(r)
+
+            for p in s.get(
+                "recent_pl",
+                []
+            ):
+
+                stats["recent_pl"].append(p)
+
+            state.agent_scores[name] = stats
+
+        saved_hist = data.get(
+            "price_history",
+            {}
+        )
+
+        for coin, hist in saved_hist.items():
+
+            state.price_history[coin] = deque(
+                hist[-200:],
+                maxlen=200
+            )
+
+        state.trade_history = list(
+            data.get(
+                "trade_history",
+                []
+            )
+        )
+
+        total_trades = sum(
+
+            s.get("trades", 0)
+
+            for s in state.agent_scores.values()
+        )
+
+        state.log(
+            f"💾 LEARNING RESTORED: "
+            f"{total_trades} trades | "
+            f"Capital ${state.capital:.2f} | "
+            f"Total P/L ${state.total_pl:+.2f}"
+        )
+
+        weights_str = " | ".join(
+
+            f"{a}:"
+            f"{state.agent_weights.get(a, 1.0):.2f}x"
+
+            for a in AGENTS
+        )
+
+        state.log(
+            f"💾 Weights restored: {weights_str}"
+        )
+
+    except Exception as e:
+
+        state.log(
+            f"⚠️ Could not load saved state "
+            f"(starting fresh): {e}"
+        )
+
 
 state = BotState()
 
+
+# =========================================================
+# RESTORE SAVED LEARNING ON STARTUP
+# =========================================================
+
+load_state()
+
+
+
+# =========================================================
+# PRICE DATA
+# =========================================================
+
 def fetch_prices():
+
     try:
+
         ids = ",".join(COINS)
-        url = f"{COINGECKO_API_URL}/simple/price?ids={ids}&vs_currencies=usd&include_24hr_change=true"
-        resp = requests.get(url, timeout=15)
+
+        url = (
+            f"{COINGECKO_API_URL}"
+            f"/simple/price"
+            f"?ids={ids}"
+            f"&vs_currencies=usd"
+            f"&include_24hr_change=true"
+        )
+
+        resp = requests.get(
+            url,
+            timeout=15
+        )
+
         if resp.status_code == 200:
+
             data = resp.json()
+
             prices = {}
+
             for coin in COINS:
-                if coin in data and "usd" in data[coin]:
+
+                if (
+                    coin in data
+                    and "usd" in data[coin]
+                ):
+
                     prices[coin] = {
+
                         "price": data[coin]["usd"],
-                        "change_24h": (data[coin].get("usd_24h_change", 0) or 0)
+
+                        "change_24h": (
+                            data[coin].get(
+                                "usd_24h_change",
+                                0
+                            )
+                            or 0
+                        )
                     }
+
             return prices
-        elif resp.status_code == 429:
-            state.log("⚠️ Rate limit — waiting...")
-            time.sleep(30)
+
+        if resp.status_code == 429:
+
+            state.log(
+                "⚠️ CoinGecko rate limit."
+            )
+
             return {}
-        else:
-            return {}
-    except Exception as e:
-        state.log(f"⚠️ Error: {e}")
+
+        state.log(
+            f"⚠️ Price API HTTP {resp.status_code}"
+        )
+
         return {}
 
+    except requests.RequestException as e:
+
+        state.log(
+            f"⚠️ Price API error: {e}"
+        )
+
+        return {}
+
+    except Exception as e:
+
+        state.log(
+            f"⚠️ Unexpected price error: {e}"
+        )
+
+        return {}
+
+
+# =========================================================
+# SHORT-TERM HELPERS
+# =========================================================
+
+def percentage_change(old, new):
+
+    if old == 0:
+        return 0.0
+
+    return (
+        (new - old)
+        / old
+        * 100
+    )
+
+
+def short_term_return(hist, bars=3):
+
+    if len(hist) <= bars:
+        return 0.0
+
+    old = hist[-bars - 1]
+
+    new = hist[-1]
+
+    return percentage_change(
+        old,
+        new
+    )
+
+
+def short_term_volatility(hist, bars=10):
+
+    if len(hist) < bars + 1:
+        return 0.0
+
+    returns = []
+
+    for i in range(
+        len(hist) - bars,
+        len(hist)
+    ):
+
+        old = hist[i - 1]
+
+        new = hist[i]
+
+        if old != 0:
+
+            returns.append(
+                percentage_change(
+                    old,
+                    new
+                )
+            )
+
+    if not returns:
+        return 0.0
+
+    avg = sum(returns) / len(returns)
+
+    variance = sum(
+        (x - avg) ** 2
+        for x in returns
+    ) / len(returns)
+
+    return variance ** 0.5
+
+
+# =========================================================
+# AGENT ENGINE
+# =========================================================
+
 def compute_agent_scores(prices):
+
     signals = {}
+
     for coin, data in prices.items():
+
         price = data["price"]
-        change_24h = data.get("change_24h", 0)
+
+        change_24h = (
+            data.get(
+                "change_24h",
+                0
+            )
+            or 0
+        )
 
         if coin not in state.price_history:
-            state.price_history[coin] = deque(maxlen=100)
-        state.price_history[coin].append(price)
-        hist = list(state.price_history[coin])
 
-        # ─── Trend Agent ───
+            state.price_history[coin] = deque(
+                maxlen=200
+            )
+
+        state.price_history[coin].append(
+            price
+        )
+
+        hist = list(
+            state.price_history[coin]
+        )
+
+        # =================================================
+        # TREND
+        # =================================================
+
         trend_score = 50
+
         trend_dir = "NEUTRAL"
-        if abs(change_24h) > 1:
-            trend_score = 55 + min(abs(change_24h) * 2, 30)
-            trend_dir = "UP" if change_24h > 0 else "DOWN"
-        elif abs(change_24h) > 0.3:
-            trend_score = 52 + min(abs(change_24h) * 3, 8)
-            trend_dir = "UP" if change_24h > 0 else "DOWN"
 
-        # ─── Momentum Agent ───
+        if len(hist) >= 6:
+
+            short = short_term_return(
+                hist,
+                5
+            )
+
+            if short > 0.20:
+
+                trend_score = min(
+                    55 + abs(short) * 12,
+                    90
+                )
+
+                trend_dir = "UP"
+
+            elif short < -0.20:
+
+                trend_score = min(
+                    55 + abs(short) * 12,
+                    90
+                )
+
+                trend_dir = "DOWN"
+
+            elif change_24h > 1:
+
+                trend_score = min(
+                    52 + change_24h * 2,
+                    80
+                )
+
+                trend_dir = "UP"
+
+            elif change_24h < -1:
+
+                trend_score = min(
+                    52 + abs(change_24h) * 2,
+                    80
+                )
+
+                trend_dir = "DOWN"
+
+        # =================================================
+        # MOMENTUM
+        # =================================================
+
         mom_score = 50
+
         mom_dir = "NEUTRAL"
-        if len(hist) >= 3:
-            recent = ((hist[-1] - hist[-3]) / hist[-3]) * 100 if hist[-3] != 0 else 0
-            if abs(recent) > 0.2:
-                mom_score = 55 + min(abs(recent) * 10, 30)
-                mom_dir = "UP" if recent > 0 else "DOWN"
-        elif abs(change_24h) > 0.5:
-            mom_score = 52 + min(abs(change_24h), 15)
-            mom_dir = "UP" if change_24h > 0 else "DOWN"
 
-        # ─── Volatility Agent ───
+        if len(hist) >= 4:
+
+            short = short_term_return(
+                hist,
+                3
+            )
+
+            if short > 0.15:
+
+                mom_score = min(
+                    55 + abs(short) * 18,
+                    90
+                )
+
+                mom_dir = "UP"
+
+            elif short < -0.15:
+
+                mom_score = min(
+                    55 + abs(short) * 18,
+                    90
+                )
+
+                mom_dir = "DOWN"
+
+        # =================================================
+        # VOLATILITY
+        # =================================================
+
         vol_score = 50
+
         vol_dir = "NEUTRAL"
-        if abs(change_24h) > 2:
-            vol_score = 58 + min(abs(change_24h), 25)
-            vol_dir = "UP" if change_24h > 0 else "DOWN"
-        elif abs(change_24h) > 0.5:
-            vol_score = 52 + min(abs(change_24h) * 2, 10)
-            vol_dir = "UP" if change_24h > 0 else "DOWN"
 
-        # ─── Support/Resistance Agent ───
+        volatility = short_term_volatility(
+            hist,
+            10
+        )
+
+        if volatility > 0.15:
+
+            if short_term_return(
+                hist,
+                3
+            ) > 0:
+
+                vol_score = min(
+                    55 + volatility * 10,
+                    85
+                )
+
+                vol_dir = "UP"
+
+            elif short_term_return(
+                hist,
+                3
+            ) < 0:
+
+                vol_score = min(
+                    55 + volatility * 10,
+                    85
+                )
+
+                vol_dir = "DOWN"
+
+        # =================================================
+        # SUPPORT / RESISTANCE
+        # =================================================
+
         sr_score = 50
-        sr_dir = "NEUTRAL"
-        if len(hist) >= 5:
-            recent = hist[-5:]
-            high, low = max(recent), min(recent)
-            if high > low:
-                pos = (price - low) / (high - low)
-                if pos > 0.8 and change_24h < 0:
-                    sr_score = 58; sr_dir = "DOWN"
-                elif pos < 0.2 and change_24h > 0:
-                    sr_score = 58; sr_dir = "UP"
 
-        # ─── Mean Reversion Agent ───
+        sr_dir = "NEUTRAL"
+
+        if len(hist) >= 10:
+
+            recent = hist[-10:]
+
+            high = max(recent)
+
+            low = min(recent)
+
+            if high > low:
+
+                position = (
+                    price - low
+                ) / (
+                    high - low
+                )
+
+                if position < 0.20:
+
+                    sr_score = 62
+
+                    sr_dir = "UP"
+
+                elif position > 0.80:
+
+                    sr_score = 62
+
+                    sr_dir = "DOWN"
+
+        # =================================================
+        # MEAN REVERSION
+        # =================================================
+
         mr_score = 50
+
         mr_dir = "NEUTRAL"
-        if len(hist) >= 5:
-            avg = sum(hist[-5:]) / 5
+
+        if len(hist) >= 10:
+
+            avg = sum(
+                hist[-10:]
+            ) / 10
+
             if avg > 0:
-                dev = ((price - avg) / avg) * 100
-                if abs(dev) > 0.3:
-                    mr_score = 55 + min(abs(dev) * 5, 25)
-                    mr_dir = "DOWN" if dev > 0 else "UP"
+
+                deviation = (
+                    (price - avg)
+                    / avg
+                    * 100
+                )
+
+                if deviation > 0.40:
+
+                    mr_score = min(
+                        55
+                        + abs(deviation) * 8,
+                        85
+                    )
+
+                    mr_dir = "DOWN"
+
+                elif deviation < -0.40:
+
+                    mr_score = min(
+                        55
+                        + abs(deviation) * 8,
+                        85
+                    )
+
+                    mr_dir = "UP"
 
         signals[coin] = {
+
             "price": price,
+
             "change_24h": change_24h,
+
+            "short_return": round(
+                short_term_return(
+                    hist,
+                    3
+                ),
+                4
+            ),
+
+            "volatility": round(
+                volatility,
+                4
+            ),
+
             "agents": {
-                "Trend": {"score": int(trend_score), "dir": trend_dir},
-                "Momentum": {"score": int(mom_score), "dir": mom_dir},
-                "Volatility": {"score": int(vol_score), "dir": vol_dir},
-                "SupportResist": {"score": int(sr_score), "dir": sr_dir},
-                "MeanReversion": {"score": int(mr_score), "dir": mr_dir}
+
+                "Trend": {
+                    "score": int(
+                        trend_score
+                    ),
+                    "dir": trend_dir
+                },
+
+                "Momentum": {
+                    "score": int(
+                        mom_score
+                    ),
+                    "dir": mom_dir
+                },
+
+                "Volatility": {
+                    "score": int(
+                        vol_score
+                    ),
+                    "dir": vol_dir
+                },
+
+                "SupportResist": {
+                    "score": int(
+                        sr_score
+                    ),
+                    "dir": sr_dir
+                },
+
+                "MeanReversion": {
+                    "score": int(
+                        mr_score
+                    ),
+                    "dir": mr_dir
+                }
             }
         }
+
     return signals
 
+
+# =========================================================
+# CONSENSUS ENGINE
+# =========================================================
+
 def get_consensus(signals):
+
     trades = []
+
     for coin, data in signals.items():
+
         agents = data["agents"]
-        total_score = 0
-        total_weight = 0
-        up_votes = 0
-        down_votes = 0
+
+        up_votes = 0.0
+
+        down_votes = 0.0
+
+        weighted_total = 0.0
+
+        total_weight = 0.0
 
         for name, info in agents.items():
-            w = state.agent_weights.get(name, 1.0)
-            total_score += info["score"] * w
-            total_weight += w
-            if info["dir"] == "UP":
-                up_votes += w
-            elif info["dir"] == "DOWN":
-                down_votes += w
 
-        avg_score = total_score / total_weight if total_weight > 0 else 50
+            weight = state.agent_weights.get(
+                name,
+                1.0
+            )
+
+            weighted_total += (
+                info["score"]
+                * weight
+            )
+
+            total_weight += weight
+
+            if info["dir"] == "UP":
+
+                up_votes += weight
+
+            elif info["dir"] == "DOWN":
+
+                down_votes += weight
+
+        if total_weight <= 0:
+            continue
+
+        avg_score = (
+            weighted_total
+            / total_weight
+        )
 
         if up_votes > down_votes:
+
             direction = "UP"
-            up_scores = [agents[n]["score"] * state.agent_weights.get(n, 1.0) 
-                        for n in agents if agents[n]["dir"] == "UP"]
-            edge = sum(up_scores) / len(up_scores) if up_scores else 0
+
         elif down_votes > up_votes:
+
             direction = "DOWN"
-            down_scores = [agents[n]["score"] * state.agent_weights.get(n, 1.0) 
-                          for n in agents if agents[n]["dir"] == "DOWN"]
-            edge = sum(down_scores) / len(down_scores) if down_scores else 0
+
         else:
+
             direction = "NEUTRAL"
-            edge = 0
 
-        if avg_score >= MIN_CONFIDENCE and edge >= MIN_EDGE and direction != "NEUTRAL":
-            # Find the LEADING agent (highest score in the winning direction)
-            winning_agents = {n: agents[n] for n in agents if agents[n]["dir"] == direction}
-            if winning_agents:
-                leading_agent = max(winning_agents, key=lambda k: winning_agents[k]["score"])
-            else:
-                leading_agent = "Trend"
+        if direction == "NEUTRAL":
+            continue
 
-            trades.append({
-                "coin": coin,
-                "symbol": COIN_SYMBOLS.get(coin, coin.upper()),
-                "price": data["price"],
-                "direction": direction,
-                "edge": round(edge, 1),
-                "confidence": round(avg_score, 1),
-                "change_24h": data["change_24h"],
-                "agents": agents,
-                "leading_agent": leading_agent
-            })
+        winning_agents = {}
 
-    trades.sort(key=lambda x: x["edge"], reverse=True)
+        for name, info in agents.items():
+
+            if info["dir"] == direction:
+
+                weight = state.agent_weights.get(
+                    name,
+                    1.0
+                )
+
+                # Actual contribution
+                contribution = (
+                    info["score"]
+                    * weight
+                )
+
+                winning_agents[name] = {
+                    "score": info["score"],
+                    "weight": weight,
+                    "contribution": contribution
+                }
+
+        if not winning_agents:
+            continue
+
+        # =================================================
+        # IMPORTANT:
+        # Agent attribution now uses weighted contribution,
+        # not raw score.
+        # =================================================
+
+        leading_agent = max(
+            winning_agents,
+            key=lambda name:
+                winning_agents[name][
+                    "contribution"
+                ]
+        )
+
+        winning_contributions = [
+            x["contribution"]
+            for x in winning_agents.values()
+        ]
+
+        edge = (
+            sum(winning_contributions)
+            / len(winning_contributions)
+        )
+
+        confidence = avg_score
+
+        # Additional agreement bonus
+        agreement_ratio = (
+            max(
+                up_votes,
+                down_votes
+            )
+            / total_weight
+        )
+
+        confidence += (
+            agreement_ratio * 10
+        )
+
+        confidence = min(
+            confidence,
+            100
+        )
+
+        # Use config thresholds
+        if (
+            confidence < MIN_CONFIDENCE
+            or edge < MIN_EDGE
+        ):
+            continue
+
+        trades.append({
+
+            "coin": coin,
+
+            "symbol": COIN_SYMBOLS.get(
+                coin,
+                coin.upper()
+            ),
+
+            "price": data["price"],
+
+            "direction": direction,
+
+            "edge": round(
+                edge,
+                1
+            ),
+
+            "confidence": round(
+                confidence,
+                1
+            ),
+
+            "change_24h": data[
+                "change_24h"
+            ],
+
+            "short_return": data[
+                "short_return"
+            ],
+
+            "volatility": data[
+                "volatility"
+            ],
+
+            "agents": agents,
+
+            "leading_agent":
+                leading_agent,
+
+            "agent_contributions":
+                winning_agents
+        })
+
+    trades.sort(
+        key=lambda x: (
+            x["confidence"],
+            x["edge"]
+        ),
+        reverse=True
+    )
+
     return trades
 
-def execute_paper_trade(trade):
-    symbol = trade["symbol"]
-    direction = trade["direction"]
-    price = trade["price"]
-    leading_agent = trade.get("leading_agent", "Trend")
-    position_size = (state.capital * POSITION_SIZE_PCT) / 100
+
+# =========================================================
+# RISK CHECKS
+# =========================================================
+
+def can_trade(trade):
+
+    state.reset_daily_if_needed()
 
     if len(state.positions) >= MAX_POSITIONS:
-        return False
-    if state.daily_loss >= DAILY_LOSS_LIMIT:
-        return False
-    if state.total_pl <= -TOTAL_LOSS_LIMIT:
+
+        return False, "MAX_POSITIONS"
+
+    if (
+        state.daily_loss
+        >= DAILY_LOSS_LIMIT
+    ):
+
+        return False, "DAILY_LOSS_LIMIT"
+
+    if (
+        state.total_pl
+        <= -TOTAL_LOSS_LIMIT
+    ):
+
+        return False, "TOTAL_LOSS_LIMIT"
+
+    # =================================================
+    # MARKET CRASH GUARD
+    # Don't open new trades while BTC is dumping.
+    # BTC 24h change is refreshed every scan.
+    # Set in mike_config.py (CRASH_GUARD_*).
+    # =================================================
+
+    if (
+        CRASH_GUARD_ENABLED
+        and state.btc_change_24h
+        <= CRASH_GUARD_BTC_DROP
+    ):
+
+        return False, "MARKET_CRASH_GUARD"
+
+    symbol = trade["symbol"]
+
+    # Duplicate position
+    for pos in state.positions:
+
+        if pos["symbol"] == symbol:
+
+            return False, "ALREADY_OPEN"
+
+    # Cooldown
+    last_time = state.last_trade_by_coin.get(
+        symbol
+    )
+
+    if last_time:
+
+        elapsed = (
+            datetime.now()
+            - last_time
+        ).total_seconds()
+
+        if elapsed < TRADE_COOLDOWN_SECONDS:
+
+            return False, "COOLDOWN"
+
+    return True, "OK"
+
+
+# =========================================================
+# PAPER EXECUTION
+# =========================================================
+
+def execute_paper_trade(trade):
+
+    allowed, reason = can_trade(
+        trade
+    )
+
+    if not allowed:
+
+        state.log(
+            f"⛔ Trade rejected: {reason}"
+        )
+
         return False
 
-    # Check if we already have a position in this coin
-    for pos in state.positions:
-        if pos["symbol"] == symbol:
-            return False
+    symbol = trade["symbol"]
+
+    direction = trade["direction"]
+
+    price = trade["price"]
+
+    leading_agent = trade[
+        "leading_agent"
+    ]
+
+    position_size = (
+        state.capital
+        * POSITION_SIZE_PCT
+        / 100
+    )
+
+    if position_size <= 0:
+        return False
+
+    if direction == "UP":
+
+        stop_loss = (
+            price
+            * (
+                1
+                - STOP_LOSS_PCT
+                / 100
+            )
+        )
+
+        take_profit = (
+            price
+            * (
+                1
+                + TAKE_PROFIT_PCT
+                / 100
+            )
+        )
+
+    else:
+
+        stop_loss = (
+            price
+            * (
+                1
+                + STOP_LOSS_PCT
+                / 100
+            )
+        )
+
+        take_profit = (
+            price
+            * (
+                1
+                - TAKE_PROFIT_PCT
+                / 100
+            )
+        )
+
+    trade_id = (
+        len(state.trade_history)
+        + len(state.positions)
+        + 1
+    )
 
     position = {
-        "id": len(state.trade_history) + len(state.positions) + 1,
+
+        "id": trade_id,
+
         "symbol": symbol,
+
+        "coin": trade["coin"],
+
         "direction": direction,
+
         "entry_price": price,
+
         "current_price": price,
+
         "size": position_size,
-        "stop_loss": price * (1 - STOP_LOSS_PCT/100) if direction == "UP" else price * (1 + STOP_LOSS_PCT/100),
-        "take_profit": price * (1 + TAKE_PROFIT_PCT/100) if direction == "UP" else price * (1 - TAKE_PROFIT_PCT/100),
+
+        "stop_loss": stop_loss,
+
+        "take_profit": take_profit,
+
         "entry_time": datetime.now(),
+
         "edge": trade["edge"],
-        "leading_agent": leading_agent,
-        "change_24h_at_entry": trade["change_24h"]
+
+        "confidence":
+            trade["confidence"],
+
+        "leading_agent":
+            leading_agent,
+
+        "change_24h_at_entry":
+            trade["change_24h"],
+
+        "short_return_at_entry":
+            trade[
+                "short_return"
+            ],
+
+        "volatility_at_entry":
+            trade[
+                "volatility"
+            ],
+
+        "agent_contributions":
+            trade[
+                "agent_contributions"
+            ]
     }
 
-    state.positions.append(position)
-    state.last_trade_time = datetime.now().strftime("%H:%M:%S")
+    state.positions.append(
+        position
+    )
 
-    # Increment trade count for the leading agent
-    if leading_agent not in state.agent_scores:
-        state.agent_scores[leading_agent] = {"wins": 0, "losses": 0, "pl": 0.0, "streak": 0, "trades": 0}
-    state.agent_scores[leading_agent]["trades"] += 1
+    state.last_trade_time = (
+        datetime.now()
+        .strftime("%H:%M:%S")
+    )
 
-    emoji = "📈" if direction == "UP" else "📉"
-    state.log(f"{emoji} TRADE #{position['id']}: {symbol} {direction} @ ${price:.4f} | Agent: {leading_agent} | Size: ${position_size:.2f} | Edge: {trade['edge']:.1f}")
+    state.last_trade_by_coin[
+        symbol
+    ] = datetime.now()
+
+    emoji = (
+        "📈"
+        if direction == "UP"
+        else "📉"
+    )
+
+    state.log(
+        f"{emoji} PAPER TRADE #{trade_id}: "
+        f"{symbol} {direction} "
+        f"@ ${price:.4f} | "
+        f"Agent: {leading_agent} | "
+        f"Conf: {trade['confidence']:.1f} | "
+        f"Edge: {trade['edge']:.1f} | "
+        f"Size: ${position_size:.2f}"
+    )
+
     return True
 
+
+# =========================================================
+# POSITION MANAGEMENT
+# =========================================================
+
 def check_positions(prices):
+
     closed = []
+
     for pos in state.positions[:]:
-        symbol = pos["symbol"]
-        coin = None
-        for c, s in COIN_SYMBOLS.items():
-            if s == symbol:
-                coin = c; break
+
+        coin = pos["coin"]
 
         if coin not in prices:
             continue
 
-        current_price = prices[coin]["price"]
-        pos["current_price"] = current_price
-        direction = pos["direction"]
-        entry = pos["entry_price"]
+        current_price = prices[
+            coin
+        ]["price"]
+
+        pos["current_price"] = (
+            current_price
+        )
+
+        entry = pos[
+            "entry_price"
+        ]
+
         size = pos["size"]
 
+        direction = pos[
+            "direction"
+        ]
+
         if direction == "UP":
-            pnl_pct = ((current_price - entry) / entry) * 100
+
+            pnl_pct = (
+                (
+                    current_price
+                    - entry
+                )
+                / entry
+                * 100
+            )
+
         else:
-            pnl_pct = ((entry - current_price) / entry) * 100
 
-        pnl_dollar = size * (pnl_pct / 100)
+            pnl_pct = (
+                (
+                    entry
+                    - current_price
+                )
+                / entry
+                * 100
+            )
 
-        if pnl_pct <= -STOP_LOSS_PCT:
-            state.log(f"🛑 STOP LOSS: {symbol} @ ${current_price:.4f} | Loss: ${abs(pnl_dollar):.2f} ({pnl_pct:.2f}%)")
-            close_position(pos, pnl_dollar, "STOP_LOSS")
+        pnl_dollar = (
+            size
+            * pnl_pct
+            / 100
+        )
+
+        if (
+            pnl_pct
+            <= -STOP_LOSS_PCT
+        ):
+
+            state.log(
+                f"🛑 STOP LOSS: "
+                f"{pos['symbol']} "
+                f"@ ${current_price:.4f} | "
+                f"${pnl_dollar:.2f}"
+            )
+
+            close_position(
+                pos,
+                pnl_dollar,
+                "STOP_LOSS"
+            )
+
             closed.append(pos)
-        elif pnl_pct >= TAKE_PROFIT_PCT:
-            state.log(f"🎯 TAKE PROFIT: {symbol} @ ${current_price:.4f} | Profit: ${pnl_dollar:.2f} ({pnl_pct:.2f}%)")
-            close_position(pos, pnl_dollar, "TAKE_PROFIT")
+
+        elif (
+            pnl_pct
+            >= TAKE_PROFIT_PCT
+        ):
+
+            state.log(
+                f"🎯 TAKE PROFIT: "
+                f"{pos['symbol']} "
+                f"@ ${current_price:.4f} | "
+                f"+${pnl_dollar:.2f}"
+            )
+
+            close_position(
+                pos,
+                pnl_dollar,
+                "TAKE_PROFIT"
+            )
+
+            closed.append(pos)
+
+            continue
+
+        # =================================================
+        # POSITION TIMEOUT
+        # Close trades sitting open too long (sideways
+        # market). Frees slots so the bot never
+        # deadlocks. Set POSITION_TIMEOUT_SECONDS in
+        # mike_config.py (default 4 hours).
+        # =================================================
+
+        elapsed = (
+            datetime.now()
+            - pos["entry_time"]
+        ).total_seconds()
+
+        if elapsed > POSITION_TIMEOUT_SECONDS:
+
+            state.log(
+                f"⏰ TIMEOUT: "
+                f"{pos['symbol']} closed after "
+                f"{elapsed / 3600:.1f}h | "
+                f"P/L ${pnl_dollar:+.2f} "
+                f"({pnl_pct:+.2f}%)"
+            )
+
+            close_position(
+                pos,
+                pnl_dollar,
+                "TIMEOUT"
+            )
+
             closed.append(pos)
 
     return closed
 
-def close_position(pos, pnl_dollar, reason):
-    state.positions.remove(pos)
-    state.capital += pnl_dollar
-    state.daily_pl += pnl_dollar
-    state.total_pl += pnl_dollar
 
-    if pnl_dollar < 0:
-        state.daily_loss += abs(pnl_dollar)
+# =========================================================
+# CLOSE + LEARNING
+# =========================================================
 
-    # Credit the trade to the agent that made the call
-    agent = pos.get("leading_agent", "Trend")
+def close_position(
+    pos,
+    pnl_dollar,
+    reason
+):
+
+    if pos not in state.positions:
+        return
+
+    state.positions.remove(
+        pos
+    )
+
+    # =================================================
+    # FEES
+    # Round-trip exchange fee subtracted from every
+    # closed trade, so paper results match real
+    # trading. Set FEE_PCT in mike_config.py.
+    # =================================================
+
+    fee = (
+        pos["size"]
+        * FEE_PCT
+        / 100
+    )
+
+    net_pnl = pnl_dollar - fee
+
+    state.log(
+        f"💸 Fee: ${fee:.2f} "
+        f"({FEE_PCT}% round trip) | "
+        f"Net P/L: ${net_pnl:+.2f}"
+    )
+
+    state.capital += net_pnl
+
+    state.daily_pl += net_pnl
+
+    state.total_pl += net_pnl
+
+    if net_pnl < 0:
+
+        state.daily_loss += abs(
+            net_pnl
+        )
+
+    agent = pos.get(
+        "leading_agent",
+        "Trend"
+    )
+
     if agent not in state.agent_scores:
-        state.agent_scores[agent] = {"wins": 0, "losses": 0, "pl": 0.0, "streak": 0, "trades": 0}
 
-    if pnl_dollar > 0:
-        state.agent_scores[agent]["wins"] += 1
-        state.agent_scores[agent]["streak"] = max(state.agent_scores[agent].get("streak", 0) + 1, 1)
+        state.agent_scores[
+            agent
+        ] = state._new_agent_stats()
+
+    scores = state.agent_scores[
+        agent
+    ]
+
+    scores["trades"] += 1
+
+    scores["pl"] += net_pnl
+
+    if net_pnl > 0:
+
+        scores["wins"] += 1
+
+        scores["streak"] = max(
+            scores.get(
+                "streak",
+                0
+            ) + 1,
+            1
+        )
+
+        result = 1
+
     else:
-        state.agent_scores[agent]["losses"] += 1
-        state.agent_scores[agent]["streak"] = min(state.agent_scores[agent].get("streak", 0) - 1, -1)
 
-    state.agent_scores[agent]["pl"] += pnl_dollar
+        scores["losses"] += 1
 
-    # ─── AUTO-OPTIMIZER ───
-    # Adjust weights after every 3 trades per agent
+        scores["streak"] = min(
+            scores.get(
+                "streak",
+                0
+            ) - 1,
+            -1
+        )
+
+        result = 0
+
+    scores[
+        "recent_results"
+    ].append(result)
+
+    scores[
+        "recent_pl"
+    ].append(net_pnl)
+
+    # =====================================================
+    # TRADE JOURNAL
+    # =====================================================
+
+    trade_record = {
+
+        "id": pos["id"],
+
+        "symbol": pos["symbol"],
+
+        "direction":
+            pos["direction"],
+
+        "entry":
+            pos["entry_price"],
+
+        "exit":
+            pos["current_price"],
+
+        "pnl":
+            round(
+                net_pnl,
+                2
+            ),
+
+        "fee":
+            round(
+                fee,
+                2
+            ),
+
+        "reason":
+            reason,
+
+        "agent":
+            agent,
+
+        "confidence":
+            pos.get(
+                "confidence",
+                0
+            ),
+
+        "edge":
+            pos.get(
+                "edge",
+                0
+            ),
+
+        "entry_time":
+            pos[
+                "entry_time"
+            ].strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+
+        "exit_time":
+            datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+    }
+
+    state.trade_history.append(
+        trade_record
+    )
+
+    state.log(
+        f"🧠 LEARNING: "
+        f"{agent} receives result "
+        f"{'WIN' if result else 'LOSS'} "
+        f"| Net P/L ${net_pnl:+.2f}"
+    )
+
     optimize_weights()
 
-    state.trade_history.append({
-        "symbol": pos["symbol"],
-        "direction": pos["direction"],
-        "entry": pos["entry_price"],
-        "exit": pos["current_price"],
-        "pnl": round(pnl_dollar, 2),
-        "reason": reason,
-        "time": datetime.now().strftime("%H:%M:%S"),
-        "agent": agent
-    })
+    # =================================================
+    # PERSISTENCE
+    # Save learning progress on every closed trade,
+    # so a restart never loses a single result.
+    # =================================================
+
+    save_state()
+
+
+# =========================================================
+# LEARNING ENGINE
+# =========================================================
 
 def optimize_weights():
-    """Adjust agent weights based on performance. Runs after every trade close."""
-    for agent, scores in state.agent_scores.items():
-        total = scores.get("wins", 0) + scores.get("losses", 0)
-        if total >= 3:  # Need at least 3 closed trades to adjust
-            win_rate = scores["wins"] / total
-            current_weight = state.agent_weights.get(agent, 1.0)
 
-            if win_rate > 0.6:
-                # Winner — boost weight
-                new_weight = min(current_weight * 1.15, 2.5)
-                if abs(new_weight - current_weight) > 0.01:
-                    state.agent_weights[agent] = new_weight
-                    state.log(f"🧠 AUTO-OPTIMIZER: {agent} weight ↑ {current_weight:.2f} → {new_weight:.2f} (WR: {win_rate*100:.0f}%)")
-            elif win_rate < 0.35:
-                # Loser — reduce weight
-                new_weight = max(current_weight * 0.85, 0.3)
-                if abs(new_weight - current_weight) > 0.01:
-                    state.agent_weights[agent] = new_weight
-                    state.log(f"🧠 AUTO-OPTIMIZER: {agent} weight ↓ {current_weight:.2f} → {new_weight:.2f} (WR: {win_rate*100:.0f}%)")
+    for agent in AGENTS:
+
+        scores = state.agent_scores.get(
+            agent
+        )
+
+        if not scores:
+            continue
+
+        total = scores.get(
+            "trades",
+            0
+        )
+
+        # Don't learn aggressively from
+        # tiny samples.
+        if total < MIN_LEARNING_TRADES:
+
+            continue
+
+        wins = scores.get(
+            "wins",
+            0
+        )
+
+        lifetime_wr = (
+            wins
+            / total
+        )
+
+        recent_results = list(
+            scores.get(
+                "recent_results",
+                []
+            )
+        )
+
+        if recent_results:
+
+            recent_wr = (
+                sum(
+                    recent_results
+                )
+                / len(
+                    recent_results
+                )
+            )
+
+        else:
+
+            recent_wr = lifetime_wr
+
+        # Blend recent performance with
+        # lifetime performance.
+        blended_wr = (
+            lifetime_wr * 0.60
+            + recent_wr * 0.40
+        )
+
+        current_weight = (
+            state.agent_weights.get(
+                agent,
+                1.0
+            )
+        )
+
+        new_weight = (
+            current_weight
+        )
+
+        if blended_wr >= 0.60:
+
+            new_weight = (
+                current_weight
+                * WEIGHT_UP_FACTOR
+            )
+
+        elif blended_wr <= 0.40:
+
+            new_weight = (
+                current_weight
+                * WEIGHT_DOWN_FACTOR
+            )
+
+        new_weight = max(
+            WEIGHT_MIN,
+            min(
+                new_weight,
+                WEIGHT_MAX
+            )
+        )
+
+        if abs(
+            new_weight
+            - current_weight
+        ) >= 0.01:
+
+            state.agent_weights[
+                agent
+            ] = new_weight
+
+            state.log(
+                f"🧠 LEARNING: "
+                f"{agent} "
+                f"{current_weight:.2f}x → "
+                f"{new_weight:.2f}x | "
+                f"WR {blended_wr * 100:.1f}% "
+                f"| Trades {total}"
+            )
+
+
+# =========================================================
+# SCAN
+# =========================================================
 
 def run_scan():
+
     with state.lock:
+
+        state.reset_daily_if_needed()
+
         state.scan_count += 1
-        state.log(f"🔍 Scan #{state.scan_count} started...")
+
+        state.log(
+            f"🔍 Scan #{state.scan_count} started..."
+        )
 
         prices = fetch_prices()
+
         if not prices:
-            state.log("❌ No price data")
+
+            state.log(
+                "❌ No price data."
+            )
+
             return
 
-        state.log(f"✅ Fetched {len(prices)} prices")
+        state.log(
+            f"✅ Fetched "
+            f"{len(prices)} prices"
+        )
 
-        # Show all coins sorted by movement
-        for coin, data in sorted(prices.items(), key=lambda x: abs(x[1]["change_24h"]), reverse=True):
-            sym = COIN_SYMBOLS.get(coin, coin.upper())
-            chg = data["change_24h"]
-            state.log(f"   📊 {sym}: ${data['price']:.4f} ({chg:+.2f}%)")
+        # Refresh BTC 24h change for the crash guard
+        btc_data = prices.get("bitcoin")
 
-        # Check existing positions for SL/TP
-        closed = check_positions(prices)
+        if btc_data:
+
+            state.btc_change_24h = (
+                btc_data.get("change_24h", 0)
+                or 0
+            )
+
+        # =================================================
+        # PRICE DISPLAY
+        # =================================================
+
+        for coin, data in sorted(
+            prices.items(),
+            key=lambda x:
+                abs(
+                    x[1][
+                        "change_24h"
+                    ]
+                ),
+            reverse=True
+        ):
+
+            symbol = COIN_SYMBOLS.get(
+                coin,
+                coin.upper()
+            )
+
+            state.log(
+                f"   📊 {symbol}: "
+                f"${data['price']:.4f} "
+                f"({data['change_24h']:+.2f}%)"
+            )
+
+        # =================================================
+        # MANAGE EXISTING POSITIONS
+        # =================================================
+
+        closed = check_positions(
+            prices
+        )
+
         if closed:
-            state.log(f"📊 Closed {len(closed)} position(s)")
 
-        # Run agents and get consensus
-        signals = compute_agent_scores(prices)
-        trades = get_consensus(signals)
+            state.log(
+                f"📊 Closed "
+                f"{len(closed)} "
+                f"position(s)"
+            )
 
-        if trades:
-            state.log(f"🎯 Found {len(trades)} trade setup(s)")
-            for t in trades[:MAX_POSITIONS - len(state.positions)]:
-                if execute_paper_trade(t):
-                    state.log(f"   → {t['symbol']} {t['direction']} | Agent: {t['leading_agent']} | Edge: {t['edge']:.1f} | Conf: {t['confidence']:.1f}")
+        # =================================================
+        # ANALYZE
+        # =================================================
+
+        signals = compute_agent_scores(
+            prices
+        )
+
+        trades = get_consensus(
+            signals
+        )
+
+        available_slots = (
+            MAX_POSITIONS
+            - len(
+                state.positions
+            )
+        )
+
+        if trades and available_slots > 0:
+
+            state.log(
+                f"🎯 Found "
+                f"{len(trades)} "
+                f"qualified setup(s)"
+            )
+
+            executed = 0
+
+            for trade in trades:
+
+                if executed >= available_slots:
+                    break
+
+                if execute_paper_trade(
+                    trade
+                ):
+
+                    executed += 1
+
+                    state.log(
+                        f"   → "
+                        f"{trade['symbol']} "
+                        f"{trade['direction']} | "
+                        f"Lead: "
+                        f"{trade['leading_agent']} | "
+                        f"Conf: "
+                        f"{trade['confidence']:.1f}"
+                    )
+
         else:
-            best = max(signals.items(), key=lambda x: max(a["score"] for a in x[1]["agents"].values()))
-            best_score = max(a["score"] for a in best[1]["agents"].values())
-            avg_score = sum(a["score"] for a in best[1]["agents"].values()) / len(best[1]["agents"])
-            dirs = [a["dir"] for a in best[1]["agents"].values() if a["dir"] != "NEUTRAL"]
-            up_count = dirs.count("UP")
-            down_count = dirs.count("DOWN")
-            state.log(f"😴 No trades — best avg: {avg_score:.0f} | UP:{up_count} DOWN:{down_count}")
 
-        # Show current weights
-        weights_str = " | ".join([f"{k}:{v:.2f}x" for k, v in state.agent_weights.items()])
-        state.log(f"⚖️ Weights: {weights_str}")
+            if available_slots <= 0:
 
-        state.log(f"💰 Capital: ${state.capital:.2f} | Daily: ${state.daily_pl:+.2f} | Total: ${state.total_pl:+.2f} | Pos: {len(state.positions)}/{MAX_POSITIONS}")
+                state.log(
+                    "⏸️ No new trades — "
+                    "maximum positions open."
+                )
+
+            else:
+
+                best_coin = None
+
+                best_score = -1
+
+                for coin, signal in signals.items():
+
+                    avg = sum(
+                        a["score"]
+                        for a in signal[
+                            "agents"
+                        ].values()
+                    ) / len(
+                        signal[
+                            "agents"
+                        ]
+                    )
+
+                    if avg > best_score:
+
+                        best_score = avg
+
+                        best_coin = coin
+
+                if best_coin:
+
+                    symbol = COIN_SYMBOLS.get(
+                        best_coin,
+                        best_coin.upper()
+                    )
+
+                    state.log(
+                        f"😴 No qualified trades — "
+                        f"best average: "
+                        f"{symbol} "
+                        f"{best_score:.1f}"
+                    )
+
+        # =================================================
+        # WEIGHTS
+        # =================================================
+
+        weights = " | ".join(
+            f"{agent}:"
+            f"{state.agent_weights.get(agent, 1.0):.2f}x"
+            for agent in AGENTS
+        )
+
+        state.log(
+            f"⚖️ Weights: {weights}"
+        )
+
+        # =================================================
+        # PERIODIC SAVE (every N scans)
+        # =================================================
+
+        if state.scan_count % SAVE_EVERY_SCANS == 0:
+
+            save_state()
+
+        # =================================================
+        # CAPITAL
+        # =================================================
+
+        state.log(
+            f"💰 Capital: "
+            f"${state.capital:.2f} | "
+            f"Daily: "
+            f"${state.daily_pl:+.2f} | "
+            f"Total: "
+            f"${state.total_pl:+.2f} | "
+            f"Pos: "
+            f"{len(state.positions)}/"
+            f"{MAX_POSITIONS}"
+        )
+
+
+# =========================================================
+# TRADING LOOP
+# =========================================================
 
 def trading_loop():
-    state.log("🚀 Mike Trader Pro Cloud — REAL LEARNING MODE")
-    state.log(f"   Mode: {state.mode} | Capital: ${state.capital:.2f}")
-    state.log(f"   Each trade assigned to the agent that triggered it")
-    state.log(f"   Auto-optimizer adjusts weights every 3+ trades per agent")
+
+    state.log(
+        "🚀 Mike Trader Pro "
+        "Learning Engine v2"
+    )
+
+    state.log(
+        f"   Mode: {state.mode}"
+    )
+
+    state.log(
+        f"   Capital: "
+        f"${state.capital:.2f}"
+    )
+
+    state.log(
+        "   🧠 Agent performance learning ENABLED"
+    )
+
+    state.log(
+        "   🛡️ Paper execution only"
+    )
 
     while state.running:
-        if state.status == "RUNNING":
-            try:
-                run_scan()
-            except Exception as e:
-                state.log(f"💥 Error: {e}")
 
-        for _ in range(SCAN_INTERVAL_SECONDS):
+        if state.status == "RUNNING":
+
+            try:
+
+                run_scan()
+
+            except Exception as e:
+
+                state.log(
+                    f"💥 Scan error: {e}"
+                )
+
+        for _ in range(
+            SCAN_INTERVAL_SECONDS
+        ):
+
             if not state.running:
                 break
+
             time.sleep(1)
 
+
+# =========================================================
+# CONTROL
+# =========================================================
+
 def start():
+
     if state.status == "RUNNING":
-        return {"message": "Already running"}
+
+        return {
+            "message":
+                "Already running"
+        }
+
     state.status = "RUNNING"
+
     state.running = True
-    if state.thread is None or not state.thread.is_alive():
-        state.thread = threading.Thread(target=trading_loop, daemon=True)
+
+    if (
+        state.thread is None
+        or not state.thread.is_alive()
+    ):
+
+        state.thread = threading.Thread(
+            target=trading_loop,
+            daemon=True
+        )
+
         state.thread.start()
-    state.log("▶️ Bot STARTED")
-    return {"message": "Bot started", "status": state.status}
+
+    state.log(
+        "▶️ Bot STARTED"
+    )
+
+    return {
+        "message":
+            "Bot started",
+        "status":
+            state.status
+    }
+
 
 def stop():
+
     state.status = "STOPPED"
+
     state.running = False
-    state.log("⏹️ Bot STOPPED")
-    return {"message": "Bot stopped", "status": state.status}
+
+    save_state()
+
+    state.log(
+        "⏹️ Bot STOPPED"
+    )
+
+    return {
+        "message":
+            "Bot stopped",
+        "status":
+            state.status
+    }
+
 
 def pause():
+
     state.status = "PAUSED"
-    state.log("⏸️ Bot PAUSED")
-    return {"message": "Bot paused", "status": state.status}
+
+    state.log(
+        "⏸️ Bot PAUSED"
+    )
+
+    return {
+        "message":
+            "Bot paused",
+        "status":
+            state.status
+    }
+
 
 def resume():
+
     state.status = "RUNNING"
-    state.log("▶️ Bot RESUMED")
-    return {"message": "Bot resumed", "status": state.status}
+
+    state.log(
+        "▶️ Bot RESUMED"
+    )
+
+    return {
+        "message":
+            "Bot resumed",
+        "status":
+            state.status
+    }
+
 
 def set_mode(mode):
-    if mode in ["SIGNAL", "PAPER", "AUTO"]:
-        state.mode = mode
-        state.log(f"🔄 Mode: {mode}")
-        return {"message": f"Mode: {mode}", "mode": mode}
-    return {"error": "Invalid mode"}
+
+    allowed_modes = [
+        "SIGNAL",
+        "PAPER",
+        "AUTO"
+    ]
+
+    if mode not in allowed_modes:
+
+        return {
+            "error":
+                "Invalid mode"
+        }
+
+    # IMPORTANT:
+    # AUTO does NOT connect to a broker.
+    # It remains paper execution.
+
+    state.mode = mode
+
+    state.log(
+        f"🔄 Mode changed to: "
+        f"{mode}"
+    )
+
+    return {
+        "message":
+            f"Mode: {mode}",
+        "mode":
+            mode
+    }
+
+
+# =========================================================
+# MAIN
+# =========================================================
 
 if __name__ == "__main__":
+
     start()
-    while True:
-        time.sleep(1)
+
+    try:
+
+        while True:
+
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+
+        stop()
+
+        print(
+            "\nMike Trader Pro stopped."
+        )
