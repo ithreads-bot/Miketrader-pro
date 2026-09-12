@@ -17,6 +17,13 @@
 #       6. 🛡️ CRASH GUARD — no new trades while
 #          BTC is dumping (-5% in 24h)
 #
+#       v2.2 UPGRADES:
+#       7. 📈 CROSSOVER AGENT — EMA9/EMA21 cross +
+#          RSI filter on real 15-minute Kraken
+#          candles (the proven strategy)
+#       8. 🌀 WHIPSAW GUARD — crossover agent
+#          stands aside in sideways chop
+#
 # PAPER-FIRST VERSION
 #
 # Improvements:
@@ -55,7 +62,8 @@ AGENTS = [
     "Momentum",
     "Volatility",
     "SupportResist",
-    "MeanReversion"
+    "MeanReversion",
+    "Crossover"
 ]
 
 DEFAULT_AGENT_STATS = {
@@ -722,6 +730,287 @@ def short_term_volatility(hist, bars=10):
 
 
 # =========================================================
+# CROSSOVER STRATEGY 📈
+# The proven momentum system as a 6th agent:
+#   BUY  = EMA9 crosses ABOVE EMA21 + RSI > 50
+#   SELL = EMA9 crosses BELOW EMA21 + RSI < 50
+# Data: Kraken public 15-minute candles (free, no key).
+# Plus a whipsaw guard: in sideways chop the agent
+# stands aside instead of bleeding stop-losses.
+# =========================================================
+
+KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC"
+
+# Latest candles per coin — refreshed every scan
+KLINES = {}
+
+
+def fetch_klines(coin):
+
+    pair = KRAKEN_PAIRS.get(coin)
+
+    if not pair:
+        return []
+
+    try:
+
+        resp = requests.get(
+
+            KRAKEN_OHLC_URL,
+
+            params={
+                "pair": pair,
+                "interval": KRAKEN_TIMEFRAME_MINUTES,
+            },
+
+            timeout=15,
+        )
+
+        if resp.status_code != 200:
+            return []
+
+        data = resp.json()
+
+        result = data.get("result", {})
+
+        candles = None
+
+        for key, value in result.items():
+
+            if key != "last":
+
+                candles = value
+
+                break
+
+        if not candles:
+            return []
+
+        # Each candle: [time, open, high, low, close,
+        #              vwap, volume, count]
+        closes = []
+
+        for c in candles:
+
+            try:
+
+                closes.append(float(c[4]))
+
+            except (ValueError, IndexError, TypeError):
+
+                continue
+
+        # Drop the still-forming candle
+        return closes[:-1]
+
+    except requests.RequestException:
+        return []
+
+    except Exception:
+        return []
+
+
+def fetch_all_klines():
+
+    klines = {}
+
+    for coin in COINS:
+
+        closes = fetch_klines(coin)
+
+        if closes:
+
+            klines[coin] = closes
+
+        # Stay well under Kraken's public rate limit
+        time.sleep(0.35)
+
+    return klines
+
+
+def compute_ema(values, period):
+
+    if len(values) < period:
+        return []
+
+    alpha = 2 / (period + 1)
+
+    ema = [sum(values[:period]) / period]
+
+    for v in values[period:]:
+
+        ema.append(
+            alpha * v
+            + (1 - alpha) * ema[-1]
+        )
+
+    return ema
+
+
+def compute_rsi(closes, period):
+
+    if len(closes) < period + 1:
+        return 50.0
+
+    gains = []
+
+    losses = []
+
+    for i in range(1, len(closes)):
+
+        change = closes[i] - closes[i - 1]
+
+        gains.append(max(change, 0))
+
+        losses.append(max(-change, 0))
+
+    avg_gain = sum(gains[:period]) / period
+
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(gains)):
+
+        avg_gain = (
+            avg_gain * (period - 1)
+            + gains[i]
+        ) / period
+
+        avg_loss = (
+            avg_loss * (period - 1)
+            + losses[i]
+        ) / period
+
+    if avg_loss == 0:
+        return 100.0
+
+    rs = avg_gain / avg_loss
+
+    return 100 - 100 / (1 + rs)
+
+
+def crossover_signal(closes):
+    """Returns (score, direction) for the EMA cross + RSI strategy."""
+
+    neutral = (50, "NEUTRAL")
+
+    needed = (
+        CROSSOVER_SLOW_EMA
+        + CROSSOVER_RSI_PERIOD
+        + 10
+    )
+
+    if len(closes) < needed:
+        return neutral
+
+    ema_fast = compute_ema(
+        closes,
+        CROSSOVER_FAST_EMA,
+    )
+
+    ema_slow = compute_ema(
+        closes,
+        CROSSOVER_SLOW_EMA,
+    )
+
+    n = min(len(ema_fast), len(ema_slow))
+
+    if n < CROSSOVER_LOOKBACK + 3:
+        return neutral
+
+    fast = ema_fast[-n:]
+
+    slow = ema_slow[-n:]
+
+    diffs = [
+
+        f - s
+
+        for f, s in zip(fast, slow)
+    ]
+
+    # =================================================
+    # WHIPSAW GUARD 🌀
+    # 3+ crosses in the last 8 candles = sideways
+    # chop. Crossover systems bleed here — stand aside.
+    # =================================================
+
+    recent = diffs[-CROSSOVER_WHIPSAW_CANDLES:]
+
+    cross_count = sum(
+
+        1
+
+        for i in range(1, len(recent))
+
+        if (recent[i] > 0)
+        != (recent[i - 1] > 0)
+    )
+
+    if cross_count >= CROSSOVER_MAX_RECENT_CROSSES:
+
+        return neutral
+
+    # Fresh cross within the last N candles?
+    cross_up = False
+
+    cross_down = False
+
+    start = max(1, len(diffs) - CROSSOVER_LOOKBACK)
+
+    for i in range(start, len(diffs)):
+
+        if (
+
+            diffs[i] > 0
+            and diffs[i - 1] <= 0
+        ):
+
+            cross_up = True
+
+        if (
+
+            diffs[i] < 0
+            and diffs[i - 1] >= 0
+        ):
+
+            cross_down = True
+
+    rsi = compute_rsi(
+        closes,
+        CROSSOVER_RSI_PERIOD,
+    )
+
+    direction = "NEUTRAL"
+
+    if cross_up and rsi > 50:
+
+        direction = "UP"
+
+    elif cross_down and rsi < 50:
+
+        direction = "DOWN"
+
+    if direction == "NEUTRAL":
+        return neutral
+
+    # Score by how strongly the EMAs are separating
+    last_price = closes[-1]
+
+    if last_price == 0:
+        return neutral
+
+    sep_pct = abs(diffs[-1]) / last_price * 100
+
+    score = 62 + min(sep_pct * 25, 18)
+
+    rsi_boost = min(abs(rsi - 50) / 50 * 8, 8)
+
+    score += rsi_boost
+
+    return (min(int(score), 90), direction)
+
+
+# =========================================================
 # AGENT ENGINE
 # =========================================================
 
@@ -956,6 +1245,23 @@ def compute_agent_scores(prices):
 
                     mr_dir = "UP"
 
+        # =================================================
+        # CROSSOVER (EMA cross + RSI on Kraken 15m
+        # candles — refreshed every scan)
+        # =================================================
+
+        co_score = 50
+
+        co_dir = "NEUTRAL"
+
+        klines_closes = KLINES.get(coin)
+
+        if klines_closes:
+
+            co_score, co_dir = crossover_signal(
+                klines_closes
+            )
+
         signals[coin] = {
 
             "price": price,
@@ -1010,6 +1316,13 @@ def compute_agent_scores(prices):
                         mr_score
                     ),
                     "dir": mr_dir
+                },
+
+                "Crossover": {
+                    "score": int(
+                        co_score
+                    ),
+                    "dir": co_dir
                 }
             }
         }
@@ -1929,6 +2242,30 @@ def run_scan():
             state.btc_change_24h = (
                 btc_data.get("change_24h", 0)
                 or 0
+            )
+
+        # =================================================
+        # 15-MINUTE CANDLES (Kraken — powers the
+        # Crossover agent's EMA/RSI strategy)
+        # =================================================
+
+        KLINES.clear()
+
+        KLINES.update(fetch_all_klines())
+
+        if KLINES:
+
+            state.log(
+                f"📈 Candles: "
+                f"{len(KLINES)} coin(s) on "
+                f"{KRAKEN_TIMEFRAME_MINUTES}m"
+            )
+
+        else:
+
+            state.log(
+                "⚠️ Candle data unavailable — "
+                "Crossover agent idle"
             )
 
         # =================================================
